@@ -76,6 +76,10 @@ const chatSchema = z.object({
   message: z.string().max(2000).default(''),
   attachments: z.array(attachmentSchema).max(3).optional(),
   history: chatHistorySchema,
+  // O LOCK-API sempre manda 'aegis' (chat embutido no LOCK); o front do
+  // LOCKIA nunca manda esse campo, então cai no default — sem isso, as duas
+  // origens recebem a mesma persona, já que passam pelo mesmo endpoint.
+  persona: z.enum(['aegis', 'lockia']).default('lockia'),
 }).refine((body) => body.message.trim().length > 0 || (body.attachments && body.attachments.length > 0), {
   message: 'Envie uma mensagem ou pelo menos um anexo.',
 });
@@ -120,7 +124,7 @@ app.post('/chat', async (request, reply) => {
     return reply.status(401).send({ message: 'Sessão expirada ou inválida. Faça login novamente.' });
   }
   try {
-    const { message, attachments, history } = chatSchema.parse(request.body);
+    const { message, attachments, history, persona } = chatSchema.parse(request.body);
 
     for (const att of attachments || []) {
       if (att.mimeType.startsWith('image/') || att.mimeType === 'application/pdf') {
@@ -135,7 +139,7 @@ app.post('/chat', async (request, reply) => {
     // responder e essa etapa consome tokens da própria resposta — um budget
     // maior evita que a resposta final saia cortada nesses casos.
     const hasImageAttachment = (attachments || []).some((a) => a.mimeType.startsWith('image/'));
-    const response = await aiService.askAegis(message, hasImageAttachment ? 1400 : 800, attachments, history);
+    const response = await aiService.askAegis(message, hasImageAttachment ? 1400 : 800, attachments, history, persona);
     return reply.send({ response });
   } catch (error) {
     if (error instanceof z.ZodError) {
