@@ -2,13 +2,19 @@ import 'dotenv/config';
 import fastify from "fastify";
 import cors from '@fastify/cors';
 import jwt from '@fastify/jwt';
+import rateLimit from '@fastify/rate-limit';
 import { z } from 'zod';
-import { aiService } from './services/AiService.js';
+import { aiService, matchesSignature } from './services/AiService.js';
 import { logCoworkEvent } from './services/AuditLog.js';
 
 // bodyLimit maior que o padrão (1MB) para caber anexos de imagem/documento
-// em base64 no chat — o limite por arquivo é reforçado abaixo.
-const app = fastify({ bodyLimit: 20 * 1024 * 1024 });
+// em base64 no chat — o limite por arquivo é reforçado abaixo. 28MB (não
+// 20MB) porque 3 anexos de 5MB brutos viram ~20MB só em base64, sem contar
+// o overhead do JSON ao redor.
+//
+// trustProxy: true porque este serviço roda atrás do proxy do Render — sem
+// isso, request.ip resolveria pro IP do proxy para todas as requisições.
+const app = fastify({ bodyLimit: 28 * 1024 * 1024, trustProxy: true });
 
 // ===================================================================
 // CONFIGURAÇÃO DOS PLUGINS
@@ -33,6 +39,13 @@ app.register(cors, {
   methods: ["GET", "POST", "OPTIONS"],
   credentials: true,
   allowedHeaders: ["Content-Type", "Authorization"],
+});
+
+// Limite geral generoso; /challenge e /cowork (maior custo de tokens Groq)
+// sobrescrevem com um limite mais apertado via config.rateLimit na rota.
+app.register(rateLimit, {
+  max: 30,
+  timeWindow: '1 minute',
 });
 
 // ===================================================================
@@ -103,7 +116,20 @@ app.get('/ping', async (request, reply) => {
 app.post('/chat', async (request, reply) => {
   try {
     await request.jwtVerify();
+  } catch {
+    return reply.status(401).send({ message: 'Sessão expirada ou inválida. Faça login novamente.' });
+  }
+  try {
     const { message, attachments, history } = chatSchema.parse(request.body);
+
+    for (const att of attachments || []) {
+      if (att.mimeType.startsWith('image/') || att.mimeType === 'application/pdf') {
+        const buffer = Buffer.from(att.data, 'base64');
+        if (!matchesSignature(buffer, att.mimeType)) {
+          return reply.status(400).send({ message: `Anexo "${att.name}" inválido: o conteúdo não corresponde ao tipo declarado.` });
+        }
+      }
+    }
 
     // O modelo de visão (usado quando há imagem anexada) "pensa" antes de
     // responder e essa etapa consome tokens da própria resposta — um budget
@@ -113,7 +139,7 @@ app.post('/chat', async (request, reply) => {
     return reply.send({ response });
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return reply.status(400).send({ message: 'Mensagem inválida.', issues: error.format() });
+      return reply.status(400).send({ message: error.issues[0]?.message || 'Mensagem inválida.', issues: error.format() });
     }
     console.error('Erro na rota /chat:', error);
     return reply.status(500).send({ message: 'Erro ao processar com IA.' });
@@ -123,6 +149,10 @@ app.post('/chat', async (request, reply) => {
 app.post('/analyze-quiz', async (request, reply) => {
   try {
     await request.jwtVerify();
+  } catch {
+    return reply.status(401).send({ message: 'Sessão expirada ou inválida. Faça login novamente.' });
+  }
+  try {
     const { wrongQuestions } = z.object({
       wrongQuestions: z.array(z.string().min(1)).min(1).max(20),
     }).parse(request.body);
@@ -131,7 +161,7 @@ app.post('/analyze-quiz', async (request, reply) => {
     return reply.send({ analysis });
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return reply.status(400).send({ message: 'Dados inválidos.' });
+      return reply.status(400).send({ message: error.issues[0]?.message || 'Dados inválidos.' });
     }
     console.error('Erro na rota /analyze-quiz:', error);
     return reply.status(500).send({ message: 'Erro ao analisar resultados.' });
@@ -143,12 +173,20 @@ app.post('/analyze-quiz', async (request, reply) => {
 app.post('/moderate-image', async (request, reply) => {
   try {
     await request.jwtVerify();
+  } catch {
+    return reply.status(401).send({ message: 'Sessão expirada ou inválida. Faça login novamente.' });
+  }
+  try {
     const { data, mimeType } = moderateImageSchema.parse(request.body);
+    const buffer = Buffer.from(data, 'base64');
+    if (!matchesSignature(buffer, mimeType)) {
+      return reply.status(400).send({ message: 'Arquivo inválido: o conteúdo não corresponde ao tipo declarado.' });
+    }
     const result = await aiService.moderateImage(data, mimeType);
     return reply.send(result);
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return reply.status(400).send({ message: 'Dados inválidos.' });
+      return reply.status(400).send({ message: error.issues[0]?.message || 'Dados inválidos.' });
     }
     console.error('Erro na rota /moderate-image:', error);
     return reply.status(502).send({ message: 'Erro ao moderar imagem.' });
@@ -161,6 +199,10 @@ app.post('/moderate-image', async (request, reply) => {
 app.post('/generate-questions', async (request, reply) => {
   try {
     await request.jwtVerify();
+  } catch {
+    return reply.status(401).send({ message: 'Sessão expirada ou inválida. Faça login novamente.' });
+  }
+  try {
     if (!request.user.is_admin) {
       return reply.status(403).send({ message: 'Acesso negado.' });
     }
@@ -169,7 +211,7 @@ app.post('/generate-questions', async (request, reply) => {
     return reply.send({ questoes });
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return reply.status(400).send({ message: 'Dados inválidos.', issues: error.format() });
+      return reply.status(400).send({ message: error.issues[0]?.message || 'Dados inválidos.', issues: error.format() });
     }
     console.error('Erro na rota /generate-questions:', error);
     return reply.status(500).send({ message: 'Erro ao gerar questões com IA.' });
@@ -182,15 +224,19 @@ app.post('/generate-questions', async (request, reply) => {
 // sandboxed (sem allow-same-origin), já que o próprio propósito do modo é
 // gerar páginas propositalmente vulneráveis.
 // ===================================================================
-app.post('/challenge', async (request, reply) => {
+app.post('/challenge', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
   try {
     await request.jwtVerify();
+  } catch {
+    return reply.status(401).send({ message: 'Sessão expirada ou inválida. Faça login novamente.' });
+  }
+  try {
     const { message, history } = challengeSchema.parse(request.body);
     const html = await aiService.generateChallenge(message, history);
     return reply.send({ html });
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return reply.status(400).send({ message: 'Mensagem inválida.', issues: error.format() });
+      return reply.status(400).send({ message: error.issues[0]?.message || 'Mensagem inválida.', issues: error.format() });
     }
     console.error('Erro na rota /challenge:', error);
     return reply.status(500).send({ message: 'Erro ao gerar o desafio.' });
@@ -203,9 +249,13 @@ app.post('/challenge', async (request, reply) => {
 // que julga cada mensagem (não só a primeira) + log de auditoria. Ver
 // AiService.ts (cowork/judgeCoworkRequest) para o desenho completo.
 // ===================================================================
-app.post('/cowork', async (request, reply) => {
+app.post('/cowork', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
   try {
     await request.jwtVerify();
+  } catch {
+    return reply.status(401).send({ message: 'Sessão expirada ou inválida. Faça login novamente.' });
+  }
+  try {
     const { message, history, authorizationConfirmed } = coworkSchema.parse(request.body);
 
     const result = await aiService.cowork(message, history, authorizationConfirmed);
@@ -215,12 +265,14 @@ app.post('/cowork', async (request, reply) => {
       proceed: result.allowed,
       concern: result.concern,
       messagePreview: message.slice(0, 200),
+      replyPreview: result.allowed ? result.reply.slice(0, 500) : undefined,
+      ip: request.ip,
     });
 
     return reply.send({ response: result.reply });
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return reply.status(400).send({ message: 'Mensagem inválida.', issues: error.format() });
+      return reply.status(400).send({ message: error.issues[0]?.message || 'Mensagem inválida.', issues: error.format() });
     }
     console.error('Erro na rota /cowork:', error);
     return reply.status(500).send({ message: 'Erro ao processar com IA.' });

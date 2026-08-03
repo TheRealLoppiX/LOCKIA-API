@@ -24,15 +24,68 @@ export interface ChatHistoryMessage {
 // custo/tokens mesmo que o histórico salvo no cliente cresça mais que isso.
 const MAX_HISTORY_MESSAGES = 12;
 
+// O Cowork julga cada mensagem com base em evidência de autorização
+// estabelecida "em algum momento da conversa" (ver COWORK_GUARD_PROMPT) —
+// uma janela maior evita que esse contexto saia da visão do classificador
+// em conversas mais longas.
+const COWORK_MAX_HISTORY_MESSAGES = 30;
+
 const MAX_DOC_CHARS = 6000;
+
+// Todas as chamadas à Groq usam este helper em vez de fetch puro, pra nunca
+// deixar uma requisição pendurada indefinidamente se a Groq travar/ficar
+// lenta — sem isso, uma instabilidade externa acumula requests em aberto
+// no processo em vez de falhar rápido.
+async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs = 30000): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Magic bytes dos formatos aceitos, pra conferir que o conteúdo real de um
+// anexo bate com o mimeType que o cliente declarou (o mimeType em si é só
+// um rótulo escolhido pelo cliente, não uma garantia).
+export function matchesSignature(buffer: Buffer, mimeType: string): boolean {
+  if (buffer.length < 4) return false;
+  switch (mimeType) {
+    case "image/png":
+      return buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47;
+    case "image/jpeg":
+      return buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+    case "image/webp":
+      return (
+        buffer.length >= 12 &&
+        buffer.toString("ascii", 0, 4) === "RIFF" &&
+        buffer.toString("ascii", 8, 12) === "WEBP"
+      );
+    case "application/pdf":
+      return buffer.toString("ascii", 0, 4) === "%PDF";
+    default:
+      // text/plain e outros formatos sem assinatura de bytes fixa: nada a
+      // verificar aqui além do que o Zod já valida.
+      return true;
+  }
+}
 
 async function extractDocumentText(attachment: ChatAttachment): Promise<string> {
   const buffer = Buffer.from(attachment.data, "base64");
   try {
     if (attachment.mimeType === "application/pdf") {
+      if (!matchesSignature(buffer, "application/pdf")) {
+        console.error(`Anexo "${attachment.name}" declarado como PDF, mas os bytes não batem com a assinatura %PDF.`);
+        return "";
+      }
       const parser = new PDFParse({ data: buffer });
-      const result = await parser.getText();
-      return result.text.slice(0, MAX_DOC_CHARS);
+      try {
+        const result = await parser.getText();
+        return result.text.slice(0, MAX_DOC_CHARS);
+      } finally {
+        await parser.destroy();
+      }
     }
     // text/plain e afins
     return buffer.toString("utf-8").slice(0, MAX_DOC_CHARS);
@@ -42,8 +95,8 @@ async function extractDocumentText(attachment: ChatAttachment): Promise<string> 
   }
 }
 
-function historyToMessages(history: ChatHistoryMessage[]) {
-  return history.slice(-MAX_HISTORY_MESSAGES).map((entry) => ({
+function historyToMessages(history: ChatHistoryMessage[], maxMessages: number = MAX_HISTORY_MESSAGES) {
+  return history.slice(-maxMessages).map((entry) => ({
     role: entry.role === "aegis" ? "assistant" : "user",
     content: entry.content,
   }));
@@ -62,7 +115,7 @@ interface ModerationResult {
 
 const moderateMessage = async (message: string): Promise<ModerationResult> => {
   try {
-    const response = await fetch(API_URL, {
+    const response = await fetchWithTimeout(API_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -94,7 +147,7 @@ const moderateMessage = async (message: string): Promise<ModerationResult> => {
       attackRequest: parsed.attack_request === true,
     };
   } catch (error) {
-    console.error("Erro na moderação do LOCKIA (seguindo com o prompt principal como defesa):", error);
+    console.error('[SECURITY][FAIL-OPEN] moderateMessage falhou, permitindo mensagem por padrão:', error);
     // Se o classificador falhar, não bloqueia a conversa — o system prompt
     // reforçado da camada 2 continua sendo a defesa principal.
     return { onTopic: true, attackRequest: false };
@@ -114,7 +167,7 @@ export interface ImageModerationResult {
 }
 
 const moderateImage = async (base64: string, mimeType: string): Promise<ImageModerationResult> => {
-  const response = await fetch(API_URL, {
+  const response = await fetchWithTimeout(API_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -232,7 +285,7 @@ const askAegis = async (prompt: string, maxTokens: number = 800, attachments: Ch
     // mesma conversa para que a IA tenha memória do que já foi dito.
     const historyMessages = historyToMessages(history);
 
-    const response = await fetch(API_URL, {
+    const response = await fetchWithTimeout(API_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -281,15 +334,46 @@ const askAegis = async (prompt: string, maxTokens: number = 800, attachments: Ch
 // modularização — então aqui só precisamos garantir que o documento seja
 // autocontido (sem <script src>/CSS/fonte externos).
 // ===================================================================
-const CHALLENGE_MAX_TOKENS = 4000;
+const CHALLENGE_MAX_TOKENS = 4500;
 
-const CHALLENGE_SYSTEM_PROMPT = `Você gera desafios práticos de cibersegurança em forma de página web, para o modo "Challenge" do LOCKIA.
+const CHALLENGE_SYSTEM_PROMPT = `Você gera desafios práticos de cibersegurança em forma de página web, para o modo "Challenge" do LOCKIA. O padrão de qualidade a mirar é o de labs como PortSwigger Web Security Academy ou HackTheBox: uma aplicação fictícia que parece um produto real, não um formulário de exemplo cru.
 
-Responda SEMPRE e SOMENTE com um documento HTML completo e autocontido: comece com <!DOCTYPE html> e termine com </html>, sem nenhum texto antes ou depois, sem blocos de código markdown (sem \`\`\`html). O CSS deve estar todo dentro de uma tag <style> no próprio documento; se precisar de JavaScript para o desafio funcionar (ex: um formulário de login vulnerável a XSS/SQLi simulado no próprio front-end), coloque tudo dentro de uma tag <script> no documento — nunca referencie um arquivo externo, CDN, fonte ou imagem externa.
+FORMATO DA RESPOSTA
+Responda SEMPRE e SOMENTE com um documento HTML completo e autocontido: comece com <!DOCTYPE html> e termine com </html>, sem nenhum texto antes ou depois, sem blocos de código markdown (sem \`\`\`html). Todo o CSS vai dentro de uma única tag <style>; todo o JavaScript necessário vai dentro de uma única tag <script>. Nunca referencie arquivo externo, CDN, fonte ou imagem externa (o iframe que renderiza isso não tem acesso à rede para carregar nada fora do próprio documento) — use a pilha de fontes do sistema (ex: "system-ui, -apple-system, Segoe UI, sans-serif") e desenhe qualquer ícone/logo com CSS puro (formas, gradientes, emoji) em vez de referenciar um arquivo.
 
-O desafio deve corresponder ao que o usuário pediu (ex: "crie um desafio de XSS numa página de comentários", "simule um login vulnerável a SQL injection"), com um visual limpo e profissional (a página em si não precisa ser sobre cibersegurança visualmente, só precisa CONTER a vulnerabilidade pedida de forma didática e resolvível). Nunca inclua instruções de como resolver o desafio dentro da própria página, a menos que o usuário peça explicitamente uma dica.
+QUALIDADE VISUAL — trate isso como um produto de verdade, não um mockup
+- Invente um nome de produto/empresa fictício e uma identidade visual coerente (paleta de 2-3 cores, tipografia consistente, logo simples em CSS/emoji) condizente com o tipo de app (ex: um "SaaS" de gestão de tarefas, um "banco digital" fictício, uma rede social fictícia) — isso dá contexto realista pro exercício, sem usar marcas reais.
+- Layout com espaçamento generoso, hierarquia visual clara (cabeçalho/nav quando fizer sentido, cards, sombras sutis, cantos arredondados), usando flexbox/grid — não uma pilha de <input> soltos no body.
+- Estados de UI que um app real teria: placeholder nos campos, foco visível, hover nos botões, mensagens de erro/sucesso estilizadas (não um alert() cru, a menos que o próprio alert() seja a prova de conceito do desafio, ex: XSS).
+- Copy (textos) em português, coerente com o produto fictício — não "Lorem ipsum" nem textos genéricos de placeholder.
 
-Se o pedido não for sobre um desafio de cibersegurança criável como página web, responda com um documento HTML simples explicando educadamente que esse pedido está fora do que o modo Challenge faz.`;
+QUALIDADE FUNCIONAL — a vulnerabilidade tem que ser de verdade explorável dentro da página, não só sugerida visualmente
+- Como não há backend real, simule um em JavaScript: um "banco de dados" em memória (array/objeto) e funções que processam o input do jeito inseguro que um backend real faria. O ponto é que o usuário consiga de fato inserir um payload e ver o efeito da vulnerabilidade acontecer ali, interativamente — nunca deixe a "query" concatenada ser só decorativa enquanto a checagem real por baixo usa comparação segura (ex: NUNCA monte a string 'SELECT * FROM users WHERE username=...' só para exibir, e depois valide o login comparando username/password direto com === — isso não é explorável, é só teatro).
+- Para desafios de injeção (SQL injection, NoSQL injection e similares) num "login"/busca/filtro simulado, use esta técnica, que É genuinamente explorável dentro do iframe sandboxed (sem acesso a nada fora dele, então é seguro usar aqui): monte a condição de checagem como uma STRING concatenada com o input bruto do usuário, e "execute" essa string com \`new Function\`, exatamente como um banco real executaria uma query concatenada — IMPORTANTE: coloque a condição interpolada em sua PRÓPRIA LINHA, separada da linha que fecha os parênteses, exatamente como no exemplo abaixo (mantenha essa quebra de linha, não "limpe" o formatamento) — isso é o que permite que um payload terminando em \`//\` funcione como o clássico comentário \`--\` do SQL, comentando só o resto daquela linha e deixando o \`);\` da linha seguinte intacto:
+\`\`\`js
+function login(username, password) {
+  const condicao = \`u.username === "\${username}" && u.password === "\${password}"\`; // concatenado sem sanitização, de propósito
+  return usuarios.find(u => {
+    try {
+      return new Function('u', \`
+        return (
+          \${condicao}
+        );
+      \`)(u);
+    } catch { return false; }
+  });
+}
+\`\`\`
+Com esse padrão, o payload clássico de bypass de login (\`" || "1"=="1" //\` no campo de usuário, equivalente ao \`' OR '1'='1' --\` de SQL de verdade) realmente quebra a condição e autentica — é isso que faz o desafio ser resolvível com o mesmo raciocínio que SQL injection de verdade, não só visualmente parecido com um exemplo.
+- Para XSS (refletido ou armazenado), a exploração natural já é real: pegue o valor bruto do input e injete via \`innerHTML\` (nunca via \`textContent\`) no ponto de exibição — isso sozinho já é suficiente, sem precisar de truque adicional.
+- Para IDOR, broken auth, CSRF etc., aplique a mesma lógica: a checagem que deveria impedir o acesso indevido tem que estar genuinamente ausente ou genuinamente quebrada no código, não só omitida da UI.
+- Implemente EXATAMENTE UMA vulnerabilidade central por desafio, a que o usuário pediu — não empilhe vários bugs não relacionados na mesma página, isso confunde o objetivo didático.
+- O "caminho feliz" (uso normal, sem payload) deve funcionar sem erros — só o caminho malicioso é que expõe a falha.
+
+O QUE NÃO FAZER
+Nunca inclua instruções de como resolver o desafio dentro da própria página (nem comentários no código-fonte revelando a falha), a menos que o usuário peça explicitamente uma dica. Não adicione um backend "seguro" alternativo nem correções — o propósito é a versão vulnerável mesmo.
+
+Se o pedido não for sobre um desafio de cibersegurança criável como página web, responda com um documento HTML simples (seguindo o mesmo padrão visual) explicando educadamente que esse pedido está fora do que o modo Challenge faz.`;
 
 const generateChallenge = async (prompt: string, history: ChatHistoryMessage[] = []): Promise<string> => {
   try {
@@ -302,7 +386,7 @@ const generateChallenge = async (prompt: string, history: ChatHistoryMessage[] =
 
     const historyMessages = historyToMessages(history);
 
-    const response = await fetch(API_URL, {
+    const response = await fetchWithTimeout(API_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -362,8 +446,8 @@ Responda APENAS com um JSON no formato {"authorized_signal": true|false, "concer
 
 const judgeCoworkRequest = async (message: string, history: ChatHistoryMessage[]): Promise<CoworkVerdict> => {
   try {
-    const historyMessages = historyToMessages(history);
-    const response = await fetch(API_URL, {
+    const historyMessages = historyToMessages(history, COWORK_MAX_HISTORY_MESSAGES);
+    const response = await fetchWithTimeout(API_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -423,9 +507,9 @@ const cowork = async (prompt: string, history: ChatHistoryMessage[] = [], author
 
   try {
     if (!GROQ_API_KEY) throw new Error("Chave Groq não configurada.");
-    const historyMessages = historyToMessages(history);
+    const historyMessages = historyToMessages(history, COWORK_MAX_HISTORY_MESSAGES);
 
-    const response = await fetch(API_URL, {
+    const response = await fetchWithTimeout(API_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -488,7 +572,7 @@ export const aiService = {
                          "referencia": "..."}]}, sem nenhum texto além do JSON.`;
 
     try {
-      const response = await fetch(API_URL, {
+      const response = await fetchWithTimeout(API_URL, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
