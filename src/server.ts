@@ -98,6 +98,8 @@ const coworkSchema = z.object({
 const moderateImageSchema = z.object({
   data: z.string().min(1),
   mimeType: z.enum(['image/png', 'image/jpeg']),
+}).refine((img) => Buffer.byteLength(img.data, 'base64') <= MAX_ATTACHMENT_BYTES, {
+  message: 'Arquivo maior que o limite de 5MB.',
 });
 
 const generateQuestionsSchema = z.object({
@@ -158,7 +160,7 @@ app.post('/analyze-quiz', async (request, reply) => {
   }
   try {
     const { wrongQuestions } = z.object({
-      wrongQuestions: z.array(z.string().min(1)).min(1).max(20),
+      wrongQuestions: z.array(z.string().min(1).max(500)).min(1).max(20),
     }).parse(request.body);
 
     const analysis = await aiService.analisarErros(wrongQuestions);
