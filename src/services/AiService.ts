@@ -627,6 +627,16 @@ export const aiService = {
           messages: [{ role: "user", content: prompt }],
           response_format: { type: "json_object" },
           temperature: 0.2,
+          // Diferente de toda outra chamada à Groq neste arquivo, esta não
+          // tinha orçamento de tokens — sem isso, o provedor aplica seu
+          // próprio limite padrão (geralmente baixo), que corta a resposta
+          // no meio do JSON para `quantidade` maiores (cada questão, com
+          // justificativa+referência em português, fica na casa de
+          // 150-250 tokens). Um JSON truncado quebra o JSON.parse abaixo e
+          // vira exatamente o erro genérico reportado pelo admin. 400
+          // tokens/questão (+ margem) cobre o pior caso (quantidade=10)
+          // com folga, sem gastar tokens à toa em pedidos pequenos.
+          max_tokens: Math.min(4500, 300 + quantidade * 400),
         }),
       });
 
