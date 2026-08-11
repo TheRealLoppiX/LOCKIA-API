@@ -115,6 +115,12 @@ const coworkSchema = z.object({
   message: z.string().min(1).max(2000),
   history: chatHistorySchema,
   authorizationConfirmed: z.boolean().default(false),
+  // Escopo autorizado declarado uma vez, na tela de consentimento (ver
+  // CoworkConsent.tsx), e reenviado em toda mensagem — dá ao classificador
+  // de risco (judgeCoworkRequest) um fato de referência fixo, em vez de
+  // precisar reconstruir esse contexto vasculhando o histórico a cada
+  // chamada (era a causa da maioria das recusas falso-positivas).
+  scope: z.string().trim().min(10).max(300).optional(),
 });
 
 const moderateImageSchema = z.object({
@@ -277,16 +283,16 @@ app.post('/challenge', { config: { rateLimit: { max: 10, timeWindow: '1 minute' 
 // que julga cada mensagem (não só a primeira) + log de auditoria. Ver
 // AiService.ts (cowork/judgeCoworkRequest) para o desenho completo.
 // ===================================================================
-app.post('/cowork', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
+app.post('/cowork', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async (request, reply) => {
   try {
     await request.jwtVerify();
   } catch {
     return reply.status(401).send({ message: 'Sessão expirada ou inválida. Faça login novamente.' });
   }
   try {
-    const { message, history, authorizationConfirmed } = coworkSchema.parse(request.body);
+    const { message, history, authorizationConfirmed, scope } = coworkSchema.parse(request.body);
 
-    const result = await aiService.cowork(message, history, authorizationConfirmed);
+    const result = await aiService.cowork(message, history, authorizationConfirmed, scope);
 
     logCoworkEvent({
       userId: request.user.sub,
@@ -294,6 +300,7 @@ app.post('/cowork', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } }
       concern: result.concern,
       messagePreview: message.slice(0, 200),
       replyPreview: result.allowed ? result.reply.slice(0, 500) : undefined,
+      scope,
       ip: request.ip,
     });
 

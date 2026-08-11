@@ -10,6 +10,7 @@ export interface CoworkAuditEntry {
   concern: string;
   messagePreview: string;
   replyPreview?: string;
+  scope?: string;
   ip?: string;
 }
 
