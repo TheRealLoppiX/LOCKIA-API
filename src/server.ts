@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import fastify from "fastify";
 import cors from '@fastify/cors';
+import helmet from '@fastify/helmet';
 import jwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
 import { z } from 'zod';
@@ -26,6 +27,19 @@ const app = fastify({ bodyLimit: 28 * 1024 * 1024, trustProxy: true });
 // dois produtos sem nenhuma ponte de SSO.
 app.register(jwt, { secret: process.env.APP_JWT_SECRET! });
 
+// Headers de segurança padrão (X-Content-Type-Options, X-Frame-Options,
+// HSTS etc.) — plataforma de cibersegurança sem isso é uma lacuna notável,
+// mesmo essa API só servindo JSON.
+// contentSecurityPolicy: false porque CSP é para documentos HTML (aqui não
+// existe nenhum); crossOriginResourcePolicy 'cross-origin' porque este
+// serviço é chamado de propósito por outra origem (o front do LOCKIA e,
+// servidor-a-servidor, o LOCK-API) — 'same-origin' (o padrão do helmet)
+// bloquearia exatamente o uso pretendido.
+app.register(helmet, {
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+});
+
 // CORS aqui é mais restrito que no LOCK-API: só a origem do front do
 // LOCKIA precisa chamar este serviço direto do navegador. O LOCK-API fala
 // com este serviço sempre de servidor pra servidor (sem CORS envolvido).
@@ -46,6 +60,14 @@ app.register(cors, {
 app.register(rateLimit, {
   max: 30,
   timeWindow: '1 minute',
+  // Sem isso, uma resposta 429 vinha com a mensagem padrão do plugin em
+  // inglês ("Rate limit exceeded, retry in ..."), destoando do resto da API
+  // (sempre em português) e do que o front sabe exibir de forma amigável.
+  errorResponseBuilder: (_request, context) => ({
+    statusCode: 429,
+    error: 'Too Many Requests',
+    message: `Muitas requisições em pouco tempo. Tente novamente em ${context.after}.`,
+  }),
 });
 
 // ===================================================================
