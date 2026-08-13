@@ -32,6 +32,16 @@ const COWORK_MAX_HISTORY_MESSAGES = 30;
 
 const MAX_DOC_CHARS = 6000;
 
+// Teto aplicado ao prompt ANTES de classificar (camada 1) e ANTES de gerar
+// (camada 2), nesta ordem, com o mesmo valor — sem isso, moderateMessage já
+// cortava internamente em 4000 chars, mas a geração recebia o texto
+// completo (mensagem + até 3 documentos de MAX_DOC_CHARS cada, ~20000
+// chars): um payload de ataque/prompt-injection posicionado depois do char
+// 4000 escapava da classificação mas era gerado normalmente mesmo assim.
+// Truncar aqui garante que a camada 1 sempre vê exatamente o que a camada 2
+// vai processar.
+const MAX_EFFECTIVE_PROMPT_CHARS = 4000;
+
 // Todas as chamadas à Groq usam este helper em vez de fetch puro, pra nunca
 // deixar uma requisição pendurada indefinidamente se a Groq travar/ficar
 // lenta — sem isso, uma instabilidade externa acumula requests em aberto
@@ -44,6 +54,19 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs = 3
   } finally {
     clearTimeout(timeout);
   }
+}
+
+// Mesmo raciocínio do fetchWithTimeout, mas pra uma promise qualquer (sem
+// AbortController — pdf-parse/pdfjs não expõe um jeito de abortar o parse
+// em andamento). Usado na extração de PDF: um arquivo adversarial dentro do
+// limite de 5MB (xref corrompido, streams com compressão patológica etc.)
+// pode fazer o parser travar por muito tempo sem nenhum limite, diferente
+// de toda chamada à Groq deste arquivo, que já tem timeout.
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs)),
+  ]);
 }
 
 // Magic bytes dos formatos aceitos, pra conferir que o conteúdo real de um
@@ -81,7 +104,7 @@ async function extractDocumentText(attachment: ChatAttachment): Promise<string> 
       }
       const parser = new PDFParse({ data: buffer });
       try {
-        const result = await parser.getText();
+        const result = await withTimeout(parser.getText(), 20000, 'Tempo esgotado ao extrair texto do PDF.');
         return result.text.slice(0, MAX_DOC_CHARS);
       } finally {
         await parser.destroy();
@@ -322,6 +345,7 @@ const askAegis = async (prompt: string, maxTokens: number = 800, attachments: Ch
         .join("\n\n");
       effectivePrompt = `${prompt}\n\n${docBlock}`;
     }
+    effectivePrompt = effectivePrompt.slice(0, MAX_EFFECTIVE_PROMPT_CHARS);
 
     // Camada 1: classificação prévia (roda sobre o texto — prompt + docs).
     // attackRequest é checado primeiro: um pedido de ataque é sempre um
@@ -468,8 +492,12 @@ const generateChallenge = async (prompt: string, history: ChatHistoryMessage[] =
     if (data.error) throw new Error(data.error.message);
 
     let content: string = data.choices[0].message.content.trim();
-    // Remove um eventual cercado de markdown, caso o modelo insista em usá-lo
-    content = content.replace(/^```html?\n?/i, "").replace(/```$/i, "").trim();
+    // Remove um eventual cercado de markdown, caso o modelo insista em usá-lo.
+    // \s* antes do $ na segunda regex tolera espaço/quebra de linha depois
+    // das crases de fechamento (ex: "```\n") — sem isso, esse caso comum não
+    // casava (```$ exige as crases bem no fim absoluto da string) e sobrava
+    // um "```" solto depois do </html>.
+    content = content.replace(/^```html?\n?/i, "").replace(/```\s*$/i, "").trim();
 
     if (containsLeak(content)) {
       return `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;"><h1>Resposta bloqueada</h1><p>${LEAK_BLOCKED_REPLY}</p></body></html>`;
@@ -672,6 +700,13 @@ export const aiService = {
       const data = await response.json();
       if (data.error) throw new Error(data.error.message);
       const content = data.choices[0].message.content;
+
+      // Mesma varredura de vazamento (camada 3) que askAegis/generateChallenge/
+      // cowork já aplicam na saída — faltava aqui, a única rota de geração
+      // que devolvia a resposta da Groq sem essa checagem.
+      if (containsLeak(content)) {
+        throw new Error("Resposta bloqueada por conter um padrão sensível.");
+      }
 
       const parsed = JSON.parse(content);
       return Array.isArray(parsed) ? parsed : (parsed.questoes || parsed.questions || []);
