@@ -115,12 +115,15 @@ const coworkSchema = z.object({
   message: z.string().min(1).max(2000),
   history: chatHistorySchema,
   authorizationConfirmed: z.boolean().default(false),
-  // Escopo autorizado declarado uma vez, na tela de consentimento (ver
-  // CoworkConsent.tsx), e reenviado em toda mensagem — dá ao classificador
-  // de risco (judgeCoworkRequest) um fato de referência fixo, em vez de
-  // precisar reconstruir esse contexto vasculhando o histórico a cada
-  // chamada (era a causa da maioria das recusas falso-positivas).
-  scope: z.string().trim().min(10).max(300).optional(),
+  // Texto extraído do certificado de autorização em PDF que o usuário
+  // envia na tela de consentimento (ver CoworkConsent.tsx/LOCK-API
+  // POST /cowork/authorizations), reenviado em toda mensagem — dá ao
+  // classificador de risco (judgeCoworkRequest) um fato de referência fixo,
+  // em vez de precisar reconstruir esse contexto vasculhando o histórico a
+  // cada chamada (era a causa da maioria das recusas falso-positivas). O
+  // teto de 8000 chars bate com MAX_COWORK_AUTH_TEXT_CHARS no LOCK-API, que
+  // já corta o texto extraído do PDF nesse tamanho antes de guardá-lo.
+  scope: z.string().trim().min(10).max(8000).optional(),
 });
 
 const moderateImageSchema = z.object({

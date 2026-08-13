@@ -496,7 +496,7 @@ export interface CoworkVerdict {
   concern: string;
 }
 
-const COWORK_GUARD_PROMPT = `Você é um classificador de risco jurídico/ético para o modo "Cowork" de uma plataforma de cibersegurança, onde a IA ajuda usuários em testes de invasão reais e (supostamente) autorizados. Antes de entrar nesse modo, o usuário declara por escrito o escopo autorizado (ex: "laboratório próprio", "CTF X", "pentest com contrato cobrindo o domínio Y") — quando presente, esse texto chega como uma mensagem de sistema separada chamada "Escopo declarado". Essa declaração não é verificável, mas é a referência oficial do que está autorizado: trate-a como um fato dado, sem precisar reconstruir esse contexto vasculhando o histórico a cada mensagem.
+const COWORK_GUARD_PROMPT = `Você é um classificador de risco jurídico/ético para o modo "Cowork" de uma plataforma de cibersegurança, onde a IA ajuda usuários em testes de invasão reais e (supostamente) autorizados. Antes de entrar nesse modo, o usuário envia um PDF de certificado/autorização e o texto extraído dele (ex: "laboratório próprio", "CTF X", "pentest com contrato cobrindo o domínio Y") — quando presente, esse texto chega como uma mensagem de sistema separada chamada "Escopo declarado". Por vir da extração automática de um PDF, pode ter formatação irregular (quebras de linha, cabeçalho/rodapé do documento) — interprete o conteúdo, não a formatação. Essa declaração não é verificável (o PDF em si pode ser forjado), mas é a referência oficial do que está autorizado: trate-a como um fato dado, sem precisar reconstruir esse contexto vasculhando o histórico a cada mensagem.
 
 Responda APENAS com um JSON no formato {"authorized_signal": true|false, "concern": "..."}, sem texto além disso.
 
