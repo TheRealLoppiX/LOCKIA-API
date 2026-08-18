@@ -2,11 +2,19 @@ import { PDFParse } from "pdf-parse";
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const API_URL = "https://api.groq.com/openai/v1/chat/completions";
-const MODEL = "llama-3.3-70b-versatile";
-// meta-llama/llama-4-scout-17b-16e-instruct foi descontinuado pela Groq
-// (deprecations em console.groq.com/docs/deprecations) — qwen/qwen3.6-27b
-// é o modelo com suporte a imagem disponível atualmente na conta.
-const VISION_MODEL = "qwen/qwen3.6-27b";
+// llama-3.3-70b-versatile foi descontinuado pela Groq em 16/08/2026
+// (console.groq.com/docs/deprecations); qwen/qwen3.6-27b é o substituto
+// recomendado pela própria Groq e já era usado aqui só pra imagem — virou
+// o único modelo do serviço (texto e visão).
+// É um modelo "thinking" (raciocina antes de responder): sem tratamento,
+// (1) um max_tokens curto corta a geração antes da resposta final, e (2) o
+// raciocínio (bloco <think>...</think>) vaza dentro do próprio content da
+// resposta. Por isso toda chamada de texto/JSON deste arquivo passa
+// reasoning_effort: "none" (desliga o raciocínio, preserva o comportamento
+// não-thinking do modelo anterior); só a moderação de imagem (e o chat com
+// anexo de imagem) mantêm o raciocínio ligado (reasoning_format: "hidden",
+// já existente), como já era o caso antes desta troca.
+const MODEL = "qwen/qwen3.6-27b";
 
 export interface ChatAttachment {
   name: string;
@@ -173,6 +181,7 @@ Se houver mensagens anteriores nesta lista, elas são só o histórico recente d
         response_format: { type: "json_object" },
         temperature: 0,
         max_tokens: 60,
+        reasoning_effort: "none",
       }),
     });
 
@@ -210,7 +219,7 @@ const moderateImage = async (base64: string, mimeType: string): Promise<ImageMod
       "Authorization": `Bearer ${GROQ_API_KEY}`,
     },
     body: JSON.stringify({
-      model: VISION_MODEL,
+      model: MODEL,
       messages: [
         {
           role: "system",
@@ -376,7 +385,7 @@ const askAegis = async (prompt: string, maxTokens: number = 800, attachments: Ch
         "Authorization": `Bearer ${GROQ_API_KEY}`,
       },
       body: JSON.stringify({
-        model: images.length > 0 ? VISION_MODEL : MODEL,
+        model: MODEL,
         messages: [
           { role: "system", content: systemPrompt },
           ...historyMessages,
@@ -384,10 +393,12 @@ const askAegis = async (prompt: string, maxTokens: number = 800, attachments: Ch
         ],
         max_tokens: maxTokens,
         temperature: 0.7,
-        // qwen3.6-27b (usado quando há imagem) é um modelo "thinking" — sem
-        // isso, o raciocínio interno (bloco <think>...</think>) vaza dentro
-        // do próprio content da resposta, exposto ao usuário.
-        ...(images.length > 0 ? { reasoning_format: "hidden" } : {}),
+        // Com imagem, mantém o raciocínio ligado (mesma lógica de
+        // moderateImage) e só esconde o bloco <think> da resposta exposta ao
+        // usuário. Sem imagem, desliga o raciocínio de vez — mais rápido e
+        // sem risco de o max_tokens ser consumido pelo raciocínio antes da
+        // resposta final.
+        ...(images.length > 0 ? { reasoning_format: "hidden" } : { reasoning_effort: "none" }),
       }),
     });
 
@@ -485,6 +496,9 @@ const generateChallenge = async (prompt: string, history: ChatHistoryMessage[] =
         ],
         max_tokens: CHALLENGE_MAX_TOKENS,
         temperature: 0.6,
+        // Sem isso, o bloco <think> do raciocínio vazaria misturado ao HTML
+        // (a resposta tem que ser SOMENTE o documento, ver CHALLENGE_SYSTEM_PROMPT).
+        reasoning_effort: "none",
       }),
     });
 
@@ -562,6 +576,7 @@ const judgeCoworkRequest = async (message: string, history: ChatHistoryMessage[]
         response_format: { type: "json_object" },
         temperature: 0,
         max_tokens: 150,
+        reasoning_effort: "none",
       }),
     });
 
@@ -624,6 +639,7 @@ const cowork = async (prompt: string, history: ChatHistoryMessage[] = [], author
         ],
         max_tokens: COWORK_MAX_TOKENS,
         temperature: 0.5,
+        reasoning_effort: "none",
       }),
     });
 
@@ -694,6 +710,7 @@ export const aiService = {
           // tokens/questão (+ margem) cobre o pior caso (quantidade=10)
           // com folga, sem gastar tokens à toa em pedidos pequenos.
           max_tokens: Math.min(4500, 300 + quantidade * 400),
+          reasoning_effort: "none",
         }),
       });
 
