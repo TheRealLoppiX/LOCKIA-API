@@ -14,7 +14,7 @@ const API_URL = "https://api.groq.com/openai/v1/chat/completions";
 // não-thinking do modelo anterior); só a moderação de imagem (e o chat com
 // anexo de imagem) mantêm o raciocínio ligado (reasoning_format: "hidden",
 // já existente), como já era o caso antes desta troca.
-const MODEL = "qwen/qwen3.6-27b";
+const MODEL = "qwen/qwen3.8-27b";
 
 export interface ChatAttachment {
   name: string;
