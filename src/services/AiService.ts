@@ -442,10 +442,11 @@ const askAegis = async (prompt: string, maxTokens: number = 800, attachments: Ch
 // ===================================================================
 const CHALLENGE_MAX_TOKENS = 6500;
 
-// Ordem de tentativa no Challenge (ver o loop em generateChallenge). O qwen
-// continua sendo o principal; os gpt-oss entram quando ele é recusado por
-// limite de taxa da Groq.
-const CHALLENGE_MODELS = [MODEL, "openai/gpt-oss-120b", "openai/gpt-oss-20b"];
+// Ordem de tentativa no Challenge (ver o loop em generateChallenge). O
+// gpt-oss-120b é o principal: no tier gratuito, o qwen ficou preso a um
+// OTPM de 1000 em produção, menor que um desafio inteiro. O qwen e o
+// gpt-oss-20b entram quando o anterior é recusado por limite de taxa da Groq.
+const CHALLENGE_MODELS = ["openai/gpt-oss-120b", MODEL, "openai/gpt-oss-20b"];
 
 function challengeModelParams(model: string) {
   if (model.startsWith("openai/gpt-oss")) {
