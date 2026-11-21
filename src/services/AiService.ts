@@ -77,6 +77,25 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: 
   ]);
 }
 
+// Recusa da Groq por limite de taxa (requisições ou tokens por minuto):
+// 429 é o caso normal; o "Request too large ... tokens per minute" pode
+// vir como 413, por isso a mensagem também é checada.
+function isGroqRateLimit(status: number, data: any): boolean {
+  if (status === 429) return true;
+  const message: string = data?.error?.message || "";
+  return data?.error?.code === "rate_limit_exceeded" || /tokens per minute|requests per minute/i.test(message);
+}
+
+// Quanto esperar antes de tentar de novo: header retry-after, depois o
+// "try again in 12.3s" da mensagem; padrão de 10 s; nunca mais que 20 s,
+// pra requisição do navegador não ficar pendurada demais.
+function groqRetryDelayMs(response: Response, data: any): number {
+  const header = Number(response.headers.get("retry-after"));
+  const fromMessage = /try again in ([\d.]+)s/i.exec(data?.error?.message || "");
+  const seconds = header > 0 ? header : fromMessage ? Number(fromMessage[1]) : 10;
+  return Math.min(Math.max(seconds, 1), 20) * 1000;
+}
+
 // Magic bytes dos formatos aceitos, pra conferir que o conteúdo real de um
 // anexo bate com o mimeType que o cliente declarou (o mimeType em si é só
 // um rótulo escolhido pelo cliente, não uma garantia).
@@ -483,28 +502,45 @@ const generateChallenge = async (prompt: string, history: ChatHistoryMessage[] =
 
     const historyMessages = historyToMessages(history);
 
-    const response = await fetchWithTimeout(API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${GROQ_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        messages: [
-          { role: "system", content: CHALLENGE_SYSTEM_PROMPT },
-          ...historyMessages,
-          { role: "user", content: prompt },
-        ],
-        max_tokens: CHALLENGE_MAX_TOKENS,
-        temperature: 0.6,
-        // Sem isso, o bloco <think> do raciocínio vazaria misturado ao HTML
-        // (a resposta tem que ser SOMENTE o documento, ver CHALLENGE_SYSTEM_PROMPT).
-        reasoning_effort: "none",
-      }),
+    const requestBody = JSON.stringify({
+      model: MODEL,
+      messages: [
+        { role: "system", content: CHALLENGE_SYSTEM_PROMPT },
+        ...historyMessages,
+        { role: "user", content: prompt },
+      ],
+      max_tokens: CHALLENGE_MAX_TOKENS,
+      temperature: 0.6,
+      // Sem isso, o bloco <think> do raciocínio vazaria misturado ao HTML
+      // (a resposta tem que ser SOMENTE o documento, ver CHALLENGE_SYSTEM_PROMPT).
+      reasoning_effort: "none",
     });
 
-    const data = await response.json();
+    // No tier gratuito, a Groq limita os tokens de SAÍDA por minuto (OTPM)
+    // da organização inteira, e um desafio gasta ~4000 de uma vez. Se outra
+    // geração acabou de consumir o orçamento, a Groq recusa o pedido antes de
+    // gerar ("Request too large ... output tokens per minute"). É transitório:
+    // espera o que a própria Groq indica (no máximo 20 s) e tenta de novo uma
+    // vez. Se ainda falhar, mostra uma mensagem específica em vez do erro genérico.
+    let data: any = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await fetchWithTimeout(API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${GROQ_API_KEY}`,
+        },
+        body: requestBody,
+      });
+      data = await response.json();
+      if (!isGroqRateLimit(response.status, data)) break;
+      if (attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, groqRetryDelayMs(response, data)));
+      } else {
+        console.warn("Challenge recusado por limite de tokens/minuto da Groq:", data?.error?.message);
+        return `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;"><h1>Muitos desafios em pouco tempo</h1><p>O limite de geração por minuto da IA foi atingido. Aguarde cerca de 1 minuto e tente novamente.</p></body></html>`;
+      }
+    }
     if (data.error) throw new Error(data.error.message);
 
     let content: string = data.choices[0].message.content.trim();
