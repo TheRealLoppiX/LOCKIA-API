@@ -431,7 +431,7 @@ const askAegis = async (prompt: string, maxTokens: number = 800, attachments: Ch
 // modularização — então aqui só precisamos garantir que o documento seja
 // autocontido (sem <script src>/CSS/fonte externos).
 // ===================================================================
-const CHALLENGE_MAX_TOKENS = 4500;
+const CHALLENGE_MAX_TOKENS = 6500;
 
 const CHALLENGE_SYSTEM_PROMPT = `Você gera desafios práticos de cibersegurança em forma de página web, para o modo "Challenge" do LOCKIA. O padrão de qualidade a mirar é o de labs como PortSwigger Web Security Academy ou HackTheBox: uma aplicação fictícia que parece um produto real, não um formulário de exemplo cru.
 
