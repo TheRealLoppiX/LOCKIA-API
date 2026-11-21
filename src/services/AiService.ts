@@ -86,16 +86,6 @@ function isGroqRateLimit(status: number, data: any): boolean {
   return data?.error?.code === "rate_limit_exceeded" || /tokens per minute|requests per minute/i.test(message);
 }
 
-// Quanto esperar antes de tentar de novo: header retry-after, depois o
-// "try again in 12.3s" da mensagem; padrão de 10 s; nunca mais que 20 s,
-// pra requisição do navegador não ficar pendurada demais.
-function groqRetryDelayMs(response: Response, data: any): number {
-  const header = Number(response.headers.get("retry-after"));
-  const fromMessage = /try again in ([\d.]+)s/i.exec(data?.error?.message || "");
-  const seconds = header > 0 ? header : fromMessage ? Number(fromMessage[1]) : 10;
-  return Math.min(Math.max(seconds, 1), 20) * 1000;
-}
-
 // Magic bytes dos formatos aceitos, pra conferir que o conteúdo real de um
 // anexo bate com o mimeType que o cliente declarou (o mimeType em si é só
 // um rótulo escolhido pelo cliente, não uma garantia).
@@ -452,6 +442,23 @@ const askAegis = async (prompt: string, maxTokens: number = 800, attachments: Ch
 // ===================================================================
 const CHALLENGE_MAX_TOKENS = 6500;
 
+// Ordem de tentativa no Challenge (ver o loop em generateChallenge). O qwen
+// continua sendo o principal; os gpt-oss entram quando ele é recusado por
+// limite de taxa da Groq.
+const CHALLENGE_MODELS = [MODEL, "openai/gpt-oss-120b", "openai/gpt-oss-20b"];
+
+function challengeModelParams(model: string) {
+  if (model.startsWith("openai/gpt-oss")) {
+    // gpt-oss sempre raciocina (não aceita "none"). A Groq devolve o
+    // raciocínio num campo separado, então o content fica só com o HTML.
+    // Os tokens de raciocínio contam no max_tokens, daí a folga de 1500.
+    return { max_tokens: CHALLENGE_MAX_TOKENS + 1500, temperature: 0.6, reasoning_effort: "low" };
+  }
+  // Sem reasoning_effort "none", o bloco <think> do qwen vazaria misturado
+  // ao HTML (a resposta tem que ser SOMENTE o documento).
+  return { max_tokens: CHALLENGE_MAX_TOKENS, temperature: 0.6, reasoning_effort: "none" };
+}
+
 const CHALLENGE_SYSTEM_PROMPT = `Você gera desafios práticos de cibersegurança em forma de página web, para o modo "Challenge" do LOCKIA. O padrão de qualidade a mirar é o de labs como PortSwigger Web Security Academy ou HackTheBox: uma aplicação fictícia que parece um produto real, não um formulário de exemplo cru.
 
 FORMATO DA RESPOSTA
@@ -502,48 +509,42 @@ const generateChallenge = async (prompt: string, history: ChatHistoryMessage[] =
 
     const historyMessages = historyToMessages(history);
 
-    const requestBody = JSON.stringify({
-      model: MODEL,
-      messages: [
-        { role: "system", content: CHALLENGE_SYSTEM_PROMPT },
-        ...historyMessages,
-        { role: "user", content: prompt },
-      ],
-      max_tokens: CHALLENGE_MAX_TOKENS,
-      temperature: 0.6,
-      // Sem isso, o bloco <think> do raciocínio vazaria misturado ao HTML
-      // (a resposta tem que ser SOMENTE o documento, ver CHALLENGE_SYSTEM_PROMPT).
-      reasoning_effort: "none",
-    });
+    const messages = [
+      { role: "system", content: CHALLENGE_SYSTEM_PROMPT },
+      ...historyMessages,
+      { role: "user", content: prompt },
+    ];
 
-    // No tier gratuito, a Groq limita os tokens de SAÍDA por minuto (OTPM)
-    // da organização inteira, e um desafio gasta ~4000 de uma vez. Se outra
-    // geração acabou de consumir o orçamento, a Groq recusa o pedido antes de
-    // gerar ("Request too large ... output tokens per minute"). É transitório:
-    // espera o que a própria Groq indica (no máximo 20 s) e tenta de novo uma
-    // vez. Se ainda falhar, mostra uma mensagem específica em vez do erro genérico.
+    // No tier gratuito, a Groq impõe ao qwen um teto de tokens de SAÍDA por
+    // minuto (OTPM) que chegou a 1000 em produção, mesmo com consumo zerado,
+    // e um desafio precisa de ~4000-5000 de uma vez. Nesse caso esperar não
+    // resolve: a Groq recusa antes de gerar ("Request too large ... output
+    // tokens per minute"). Por isso, se um modelo for recusado por limite de
+    // taxa, o próximo da lista é tentado na hora. Só quando todos recusam a
+    // página "Muitos desafios" aparece.
     let data: any = null;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (const model of CHALLENGE_MODELS) {
       const response = await fetchWithTimeout(API_URL, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${GROQ_API_KEY}`,
         },
-        body: requestBody,
-      });
+        body: JSON.stringify({ model, messages, ...challengeModelParams(model) }),
+      }, 60000);
       data = await response.json();
       if (!isGroqRateLimit(response.status, data)) break;
-      if (attempt === 0) {
-        await new Promise((resolve) => setTimeout(resolve, groqRetryDelayMs(response, data)));
-      } else {
-        console.warn("Challenge recusado por limite de tokens/minuto da Groq:", data?.error?.message);
-        return `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;"><h1>Muitos desafios em pouco tempo</h1><p>O limite de geração por minuto da IA foi atingido. Aguarde cerca de 1 minuto e tente novamente.</p></body></html>`;
-      }
+      console.warn(`Challenge: ${model} recusado por limite de taxa da Groq, tentando o próximo modelo:`, data?.error?.message);
+      data = null;
+    }
+    if (!data) {
+      console.warn("Challenge: todos os modelos recusados por limite de taxa da Groq.");
+      return `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;"><h1>Muitos desafios em pouco tempo</h1><p>O limite de geração por minuto da IA foi atingido. Aguarde cerca de 1 minuto e tente novamente.</p></body></html>`;
     }
     if (data.error) throw new Error(data.error.message);
 
-    let content: string = data.choices[0].message.content.trim();
+    let content: string = (data.choices?.[0]?.message?.content || "").trim();
+    if (!content) throw new Error("Resposta vazia do modelo (possivelmente cortada por max_tokens).");
     // Remove um eventual cercado de markdown, caso o modelo insista em usá-lo.
     // \s* antes do $ na segunda regex tolera espaço/quebra de linha depois
     // das crases de fechamento (ex: "```\n") — sem isso, esse caso comum não
